@@ -422,6 +422,7 @@ fn attempt_constant_time_file_copy(
 ) -> Result<ConstantTimeCopyAttempt, std::io::Error> {
     // FIXME: Look into Windows's constant time copy support
     // while NTFS doesn't support CoW, there might still be mechanisms for server-side copy on something like NFS
+    // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/4dc02779-9d95-43f8-bba4-8d4ce4961458
     #[cfg(target_os = "windows")]
     {
         let src = File::open(src)?;
@@ -469,6 +470,7 @@ fn attempt_constant_time_file_copy(
         let src_path = CString::new(src.as_os_str().as_bytes())?;
         let dst_path = CString::new(dst.as_os_str().as_bytes())?;
         // see https://www.unix.com/man-page/mojave/2/fclonefileat
+        // dst path must not already exist
         let res = unsafe { clonefile(src_path.as_ptr(), dst_path.as_ptr(), 0) };
         if res >= 0 {
             return Ok(ConstantTimeCopyAttempt::Success);
@@ -495,6 +497,18 @@ fn attempt_constant_time_file_copy(
             dst
         })
     }
+}
+
+fn copy_file_offset(
+    src: &mut File,
+    dst: &mut File,
+    offset: u64,
+    len: u64
+)
+{
+    // TODO: impl linux, mac, windows, and userspace fallback using sendfile64 or equivalent
+
+    // will need to do fsync afterwards
 }
 
 // This uses `std::fs::copy` to copy a file. There is another function called `copy_file_with_progressbar`
