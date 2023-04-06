@@ -1,4 +1,4 @@
-use std::fs::read_link;
+use std::fs::{File, read_link};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -66,6 +66,7 @@ impl Command for Cp {
                 Some('n'),
             )
             .switch("progress", "enable progress bar", Some('p'))
+            .switch("no-cow", "disable copy-on-write even on filesystems with support, always creating duplicate blocks", None)
             .category(Category::FileSystem)
     }
 
@@ -88,6 +89,7 @@ impl Command for Cp {
         let verbose = call.has_flag("verbose");
         let interactive = call.has_flag("interactive");
         let progress = call.has_flag("progress");
+        let disable_cow = call.has_flag("no-cow");
 
         let current_dir_path = current_dir(engine_state, stack)?;
         let source = current_dir_path.join(src.item.as_str());
@@ -195,20 +197,21 @@ impl Command for Cp {
                                     interactive,
                                     src,
                                     dst,
+                                    disable_cow,
                                     span,
                                     &ctrlc,
                                     copy_file_with_progressbar,
                                 )
                             } else {
-                                interactive_copy(interactive, src, dst, span, &None, copy_file)
+                                interactive_copy(interactive, src, dst, disable_cow, span, &None, copy_file)
                             }
                         } else if progress {
                             // use std::io::copy to get the progress
                             // slower then std::fs::copy but useful if user needs to see the progress
-                            copy_file_with_progressbar(src, dst, span, &ctrlc)
+                            copy_file_with_progressbar(src, dst, disable_cow, span, &ctrlc)
                         } else {
                             // use std::fs::copy
-                            copy_file(src, dst, span, &None)
+                            copy_file(src, dst, disable_cow, span, &None)
                         };
                         result.push(res);
                     }
@@ -293,9 +296,9 @@ impl Command for Cp {
                     }
                     if s.is_symlink() && not_follow_symlink {
                         let res = if interactive && d.exists() {
-                            interactive_copy(interactive, s, d, span, &None, copy_symlink)
+                            interactive_copy(interactive, s, d, disable_cow, span, &None, copy_symlink)
                         } else {
-                            copy_symlink(s, d, span, &None)
+                            copy_symlink(s, d, disable_cow, span, &None)
                         };
                         result.push(res);
                     } else if s.is_file() {
@@ -305,17 +308,18 @@ impl Command for Cp {
                                     interactive,
                                     s,
                                     d,
+                                    disable_cow, 
                                     span,
                                     &ctrlc,
                                     copy_file_with_progressbar,
                                 )
                             } else {
-                                interactive_copy(interactive, s, d, span, &None, copy_file)
+                                interactive_copy(interactive, s, d, disable_cow, span, &None, copy_file)
                             }
                         } else if progress {
-                            copy_file_with_progressbar(s, d, span, &ctrlc)
+                            copy_file_with_progressbar(s, d, disable_cow, span, &ctrlc)
                         } else {
-                            copy_file(s, d, span, &None)
+                            copy_file(s, d, disable_cow, span, &None)
                         };
                         result.push(res);
                     };
@@ -369,9 +373,10 @@ fn interactive_copy(
     interactive: bool,
     src: PathBuf,
     dst: PathBuf,
+    disable_cow: bool,
     span: Span,
     _ctrl_status: &Option<Arc<AtomicBool>>,
-    copy_impl: impl Fn(PathBuf, PathBuf, Span, &Option<Arc<AtomicBool>>) -> Value,
+    copy_impl: impl Fn(PathBuf, PathBuf, bool, Span, &Option<Arc<AtomicBool>>) -> Value,
 ) -> Value {
     let (interaction, confirmed) = try_interaction(
         interactive,
@@ -391,7 +396,104 @@ fn interactive_copy(
         let msg = format!("{:} not copied to {:}", src.display(), dst.display());
         Value::String { val: msg, span }
     } else {
-        copy_impl(src, dst, span, &None)
+        copy_impl(src, dst, disable_cow, span, &None)
+    }
+}
+
+enum ConstantTimeCopyAttempt
+{
+    Success,
+    // "Unsupported" variant returns src and dst fds, 
+    // so we can account for different syscall APIs for platforms while ensuring we only create the fd once
+    Unsupported
+    {
+        src: File,
+        dst: File
+    }
+}
+
+// attempt to copy a file in O(1) time, if the underlying filesystem supports it
+// rust's std doesn't have any mechanism to report whether constant copy is possible, so use need to rely on direct syscalls
+// while std::fs::copy() uses O(1) copy if possible, it falls back to slow without reporting back, which makes implementing progress bars impossible
+// returns true if constant time copy was successful, false if filesystem lacks support
+fn attempt_constant_time_file_copy(
+    src: PathBuf,
+    dst: PathBuf
+) -> Result<ConstantTimeCopyAttempt, std::io::Error> {
+    // FIXME: Look into Windows's constant time copy support
+    // while NTFS doesn't support CoW, there might still be mechanisms for server-side copy on something like NFS
+    #[cfg(target_os = "windows")]
+    {
+        let src = File::open(src)?;
+        let dst = File::create(dst)?;
+        return ConstantTimeCopyResult::Unsupported {
+            src,
+            dst
+        };
+    }
+
+    // linux
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use libc::{ioctl, FICLONE, EINVAL, EISDIR, EOPNOTSUPP, ETXTBSY, EXDEV};
+        use std::os::unix::io::AsRawFd;
+
+        let src = File::open(src)?;
+        let dst = File::create(dst)?;
+
+        let src_fd = src.as_raw_fd();
+        let dst_fd = dst.as_raw_fd();
+        // see https://man7.org/linux/man-pages/man2/ioctl_ficlonerange.2.html
+        let res = unsafe { ioctl(dst_fd, FICLONE, src_fd) };
+        if res >= 0 {
+            return Ok(ConstantTimeCopyAttempt::Success);
+        }
+        // catch errors that are unique to constant time copy (i.e. ones that should fallback to a normal copy)
+        if [EINVAL, EISDIR, EOPNOTSUPP, ETXTBSY, EXDEV].contains(&res) {
+            return Ok(ConstantTimeCopyAttempt::Unsupported { src, dst });
+        }
+        let err = std::io::Error::last_os_error();
+        return Err(err)
+    }
+
+    // macOS
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        use libc::{clonefile, CLONE_NOOWNERCOPY, ENOTSUP, EXDEV};
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        // FIXME: need to ensure that src and dst are absolute paths
+
+        // man page implies that both src and dst must be absolute paths
+        let src_path = CString::new(src.as_os_str().as_bytes())?;
+        let dst_path = CString::new(dst.as_os_str().as_bytes())?;
+        // see https://www.unix.com/man-page/mojave/2/fclonefileat
+        let res = unsafe { clonefile(src_path.as_ptr(), dst_path.as_ptr(), 0) };
+        if res >= 0 {
+            return Ok(ConstantTimeCopyAttempt::Success);
+        }
+        // catch errors that are unique to constant time copy (i.e. ones that should fallback to a normal copy)
+        if [ENOTSUP, EXDEV].contains(&res) {
+            let src = File::open(src)?;
+            let dst = File::create(dst)?;
+            return Ok(ConstantTimeCopyAttempt::Unsupported { src, dst });
+        }
+        let err = std::io::Error::last_os_error();
+        return Err(err)
+    }
+
+    // TODO: FreeBSD, OpenBSD
+
+    // all other OSes
+    #[allow(unreachable_code)]
+    {
+        let src = File::open(src)?;
+        let dst = File::create(dst)?;
+        Ok(ConstantTimeCopyAttempt::Unsupported {
+            src,
+            dst
+        })
     }
 }
 
@@ -402,6 +504,7 @@ fn interactive_copy(
 fn copy_file(
     src: PathBuf,
     dst: PathBuf,
+    disable_cow: bool,
     span: Span,
     _ctrlc_status: &Option<Arc<AtomicBool>>,
 ) -> Value {
@@ -420,13 +523,14 @@ fn copy_file(
 fn copy_file_with_progressbar(
     src: PathBuf,
     dst: PathBuf,
+    disable_cow: bool,
     span: Span,
     ctrlc_status: &Option<Arc<AtomicBool>>,
 ) -> Value {
     let mut bytes_processed: u64 = 0;
     let mut process_failed: Option<std::io::Error> = None;
 
-    let file_in = match std::fs::File::open(&src) {
+    let file_in = match File::open(&src) {
         Ok(file) => file,
         Err(error) => return convert_io_error(error, src, dst, span),
     };
@@ -438,7 +542,7 @@ fn copy_file_with_progressbar(
 
     let mut bar = progress_bar::NuProgressBar::new(file_size);
 
-    let file_out = match std::fs::File::create(&dst) {
+    let file_out = match File::create(&dst) {
         Ok(file) => file,
         Err(error) => return convert_io_error(error, src, dst, span),
     };
@@ -510,6 +614,7 @@ fn copy_file_with_progressbar(
 fn copy_symlink(
     src: PathBuf,
     dst: PathBuf,
+    _disable_cow: bool,
     span: Span,
     _ctrlc_status: &Option<Arc<AtomicBool>>,
 ) -> Value {
